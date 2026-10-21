@@ -1,0 +1,7 @@
+# environments / caches
+.venv/
+__pycache__/
+*.pyc
+
+# masks + image copies produced by the tool
+work/
