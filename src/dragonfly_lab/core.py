@@ -1,4 +1,3 @@
-"""Pure-CPU classical vision for dragonfly macro photos (no ML models)."""
 from __future__ import annotations
 
 import json
@@ -12,7 +11,9 @@ import numpy as np
 MAX_SIDE = 2400  # detection / editing proxy size; exports are full resolution
 
 _ROOT = Path(__file__).resolve().parents[2]
-WORK_ROOT = (_ROOT if (_ROOT / "pyproject.toml").exists() else Path.cwd()) / "work"
+PROJECT_ROOT = _ROOT if (_ROOT / "pyproject.toml").exists() else Path.cwd()
+# Annotation output goes to  <project>/src/<image name>/
+OUTPUT_ROOT = PROJECT_ROOT / "src"
 
 
 # --------------------------------------------------------------------------- IO
@@ -38,13 +39,21 @@ def make_proxy(img: np.ndarray) -> tuple[np.ndarray, float]:
         img = cv2.resize(img, (round(w * s), round(h * s)), interpolation=cv2.INTER_AREA)
     return img, s
 
+_IMG_EXTS = {".jpg", ".jpeg", ".png", ".tif", ".tiff", ".bmp", ".webp"}
 
-def work_dir_for(src: Path) -> Path:
-    return WORK_ROOT / src.stem
+def clean_stem(src: Path) -> str:
+  name = src.name
+  while Path(name).suffix.lower() in _IMG_EXTS:
+    name = Path(name).stem
+  return name
 
 
-def load_mask(work_dir: Path, shape: tuple[int, int]) -> np.ndarray | None:
-    p = work_dir / "mask.png"
+def output_dir_for(src: Path) -> Path:
+    return OUTPUT_ROOT / clean_stem(src)
+
+
+def load_mask(out_dir: Path, shape: tuple[int, int], stem: str) -> np.ndarray | None:
+    p = out_dir / f"{stem}_mask.png"
     if not p.exists():
         return None
     m = cv2.imdecode(np.fromfile(str(p), np.uint8), cv2.IMREAD_GRAYSCALE)
@@ -163,6 +172,24 @@ def detect_body_and_wings(bgr: np.ndarray, sensitivity: float = 1.0) -> BodyWing
     return BodyWings(body, wings, body_cnts, wing_cnts, wing_cent)
 
 
+def exclusion_zone(det: BodyWings | None, margin: float, shape: tuple[int, int]) -> np.ndarray:
+    """Whole dragonfly (body + wings, gaps between them bridged) grown by `margin` px. uint8 0/255."""
+    h, w = shape
+    zone = np.zeros((h, w), np.uint8)
+    if det is None:
+        return zone
+    fly = (((det.body > 0) | (det.wings > 0)).astype(np.uint8)) * 255
+    if not fly.any():
+        return zone
+    fly = cv2.morphologyEx(fly, cv2.MORPH_CLOSE, _ellipse(_odd(min(61, max(5, margin)))))
+    fly = _fill_external(fly)                           # fill holes between wings / body
+    if margin > 0:
+        d = cv2.distanceTransform(255 - fly, cv2.DIST_L2, 5)
+        zone[d <= margin] = 255
+    zone[fly > 0] = 255
+    return zone
+
+
 # ------------------------------------------------------------------ dust finder
 @dataclass
 class Speck:
@@ -174,9 +201,12 @@ class Speck:
     contour: np.ndarray
 
 
-def detect_dust(bgr: np.ndarray, body: np.ndarray | None = None, sensitivity: float = 5.0,
-                max_diam: int = 20, ignore_body: bool = True) -> list[Speck]:
-    """Tiny compact blobs that are darker/brighter than their local surroundings."""
+def detect_dust(bgr: np.ndarray, exclude: np.ndarray | None = None, sensitivity: float = 5.0,
+                max_diam: int = 20) -> list[Speck]:
+    """Tiny compact blobs darker/brighter than their surroundings.
+
+    Any blob that touches the `exclude` zone (dragonfly + margin) is discarded entirely.
+    """
     gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
     k = _odd(max(7, max_diam * 2.5))
     local = cv2.medianBlur(gray, k)                       # speck-free local background
@@ -186,23 +216,24 @@ def detect_dust(bgr: np.ndarray, body: np.ndarray | None = None, sensitivity: fl
     thr = max(4.0 + (10.0 - sensitivity), (12.0 - sensitivity) * sigma)
 
     mask = (ad > thr).astype(np.uint8)
-    if ignore_body and body is not None and body.any():
-        mask[cv2.dilate(body, _ellipse(_odd(max_diam))) > 0] = 0
 
     n, lbl, stats, cents = cv2.connectedComponentsWithStats(mask, connectivity=8)
     if n <= 1:
         return []
+    flat = lbl.ravel()
     area = stats[:, cv2.CC_STAT_AREA].astype(np.float32)
     bw = stats[:, cv2.CC_STAT_WIDTH].astype(np.float32)
     bh = stats[:, cv2.CC_STAT_HEIGHT].astype(np.float32)
     longest, shortest = np.maximum(bw, bh), np.maximum(1, np.minimum(bw, bh))
     ok = (np.arange(n) > 0) & (area >= 3) & (longest <= max_diam) \
         & (area / (bw * bh) >= 0.4) & (longest / shortest <= 3.0)    # compact: rejects veins / edges
+    if exclude is not None and exclude.any():
+        touches = np.bincount(flat, weights=(exclude.ravel() > 0).astype(np.float32), minlength=n) > 0
+        ok &= ~touches
     idx = np.flatnonzero(ok)
     if len(idx) == 0:
         return []
 
-    flat = lbl.ravel()
     contrast = np.bincount(flat, weights=ad.ravel(), minlength=n) / np.maximum(area, 1)
     signed = np.bincount(flat, weights=diff.ravel(), minlength=n)
     idx = idx[np.argsort(-contrast[idx])][:3000]
@@ -220,12 +251,25 @@ def detect_dust(bgr: np.ndarray, body: np.ndarray | None = None, sensitivity: fl
     return specks
 
 
-# ------------------------------------------------------------------------ save
-def save_outputs(src: Path, full_bgr: np.ndarray, mask_proc: np.ndarray,
-                 det: BodyWings | None, specks: list[Speck], scale: float) -> Path:
-    out = work_dir_for(src)
+# ------------------------------------------------------------- annotation export
+def _scaled_contour(c: np.ndarray, scale: float) -> np.ndarray:
+    return np.round(c.reshape(-1, 2).astype(np.float32) / scale).astype(np.int32)
+
+
+def save_annotation(src: Path, full_bgr: np.ndarray, mask_proc: np.ndarray,
+                    det: BodyWings | None, specks: list[Speck], scale: float) -> Path:
+    """Writes  <project>/src/<name>/ :
+         <name>.<ext>          copy of the original image
+         <name>_mask.png       full editable mask (brush + body/wing/dust you painted)
+         wings_mask.png        detected wings
+         dust_mask.png         the dust specks still kept in the list
+         dust_instances.json   one entry per kept dust speck
+    """
+    out = output_dir_for(src)
     out.mkdir(parents=True, exist_ok=True)
-    copy = out / f"original{src.suffix.lower()}"
+    stem = clean_stem(src)
+
+    copy = out / f"{stem}{src.suffix.lower()}"
     if not copy.exists():
         shutil.copy2(src, copy)
 
@@ -235,26 +279,54 @@ def save_outputs(src: Path, full_bgr: np.ndarray, mask_proc: np.ndarray,
         big = cv2.resize(m, (W, H), interpolation=cv2.INTER_LINEAR)
         return ((big > 127) * 255).astype(np.uint8)
 
-    full_mask = up(mask_proc)
-    imwrite(out / "mask.png", full_mask)
-    rgba = cv2.cvtColor(full_bgr, cv2.COLOR_BGR2BGRA)
-    rgba[..., 3] = 255 - full_mask                       # masked pixels become transparent
-    imwrite(out / f"{src.stem}_masked.png", rgba)
-    if det is not None:
-        imwrite(out / "body.png", up(det.body))
-        imwrite(out / "wings.png", up(((det.wings > 0) * 255).astype(np.uint8)))
+    imwrite(out / f"{stem}_mask.png", up(mask_proc))
 
-    report = {
-        "source": str(src),
-        "size": [W, H],
-        "masked_fraction": float((full_mask > 0).mean()),
-        "wings": 0 if det is None else len(det.wing_contours),
-        "dust_specks": [
-            {"x": round(s.cx / scale, 1), "y": round(s.cy / scale, 1),
-             "radius": round(s.r / scale, 1), "dark": s.dark,
-             "masked": bool(mask_proc[int(s.cy), int(s.cx)] > 0)}
-            for s in specks
-        ],
-    }
-    (out / "report.json").write_text(json.dumps(report, indent=2))
+    wings = np.zeros((H, W), np.uint8) if det is None else up(((det.wings > 0) * 255).astype(np.uint8))
+    imwrite(out / "wings_mask.png", wings)
+
+    dust = np.zeros((H, W), np.uint8)
+    margin = max(1, round(5 / scale))
+    instances = []
+    for i, s in enumerate(specks, 1):
+        c = _scaled_contour(s.contour, scale)
+        cnt = c.reshape(-1, 1, 2)
+        cv2.drawContours(dust, [cnt], -1, 255, cv2.FILLED)
+        cv2.drawContours(dust, [cnt], -1, 255, margin)
+        x, y, w, h = cv2.boundingRect(cnt)
+        instances.append({
+            "id": i,
+            "center": [round(s.cx / scale, 1), round(s.cy / scale, 1)],
+            "radius": round(s.r / scale, 1),
+            "bbox": [int(x), int(y), int(w), int(h)],
+            "area": float(cv2.contourArea(cnt)),
+            "dark": bool(s.dark),
+            "contrast": round(float(s.contrast), 2),
+            "contour": c.tolist(),
+        })
+    imwrite(out / "dust_mask.png", dust)
+
+    (out / "dust_instances.json").write_text(json.dumps({
+        "image": src.name,
+        "width": W,
+        "height": H,
+        "count": len(instances),
+        "instances": instances,
+    }, indent=2))
     return out
+
+
+def load_dust(out_dir: Path, scale: float) -> list[Speck]:
+    """Restore the dust list from a previous export (coordinates back to proxy space)."""
+    p = out_dir / "dust_instances.json"
+    if not p.exists():
+        return []
+    try:
+        data = json.loads(p.read_text())
+        specks = []
+        for it in data["instances"]:
+            c = (np.array(it["contour"], np.float32) * scale).round().astype(np.int32).reshape(-1, 1, 2)
+            specks.append(Speck(it["center"][0] * scale, it["center"][1] * scale, it["radius"] * scale,
+                                float(it["contrast"]), bool(it["dark"]), c))
+        return specks
+    except (KeyError, ValueError, TypeError):
+        return []

@@ -1,4 +1,3 @@
-"""Dark customtkinter UI for Dragonfly Lab."""
 from __future__ import annotations
 
 import math
@@ -25,6 +24,9 @@ DANGER, DANGER_H = "#3a1f27", "#55283a"
 C_BODY, C_WING = (191, 212, 45), (246, 92, 139)
 C_DUST, C_DUST_DONE = (36, 191, 251), (128, 222, 74)
 C_MASK = (94, 63, 244)
+C_ZONE = (120, 120, 120)
+
+TOOLS = ["Brush", "Pick", "Remove dust"]
 
 
 class App(ctk.CTk):
@@ -43,7 +45,7 @@ class App(ctk.CTk):
         self.det: core.BodyWings | None = None
         self.specks: list[core.Speck] = []
         self.sp_x = self.sp_y = self.sp_r = np.zeros(0)
-        self.undo_stack: list[np.ndarray] = []
+        self.undo_stack: list[tuple[np.ndarray, list[core.Speck]]] = []
 
         # view state
         self.zoom, self.ox, self.oy = 1.0, 0.0, 0.0
@@ -82,20 +84,23 @@ class App(ctk.CTk):
         self._btn(side, "Detect body & wings", self.detect_body_wings)
         self.sens_dust = self._slider(side, "Dust sensitivity", 1, 10, 5, 9, "{:.0f}")
         self.max_speck = self._slider(side, "Max speck size (px)", 6, 60, 20, 54, "{:.0f}")
-        self.ignore_body = ctk.BooleanVar(value=True)
-        ctk.CTkSwitch(side, text="Ignore body while hunting dust", variable=self.ignore_body,
-                      text_color=TEXT, progress_color=ACCENT, button_color=TEXT,
-                      fg_color=BORDER).pack(anchor="w", pady=(4, 6))
+        self.avoid_fly = ctk.BooleanVar(value=True)
+        ctk.CTkSwitch(side, text="Keep dust away from dragonfly", variable=self.avoid_fly,
+                      command=self.request_render, text_color=TEXT, progress_color=ACCENT,
+                      button_color=TEXT, fg_color=BORDER).pack(anchor="w", pady=(4, 2))
+        self.keep_away = self._slider(side, "Keep-away margin (px)", 0, 150, 40, 150, "{:.0f}")
         self._btn(side, "Detect dust specks", self.detect_dust)
 
         self._section(side, "MASK")
         self.tool = ctk.StringVar(value="Brush")
-        ctk.CTkSegmentedButton(side, values=["Brush", "Pick"], variable=self.tool,
+        ctk.CTkSegmentedButton(side, values=TOOLS, variable=self.tool,
                                command=lambda v: self._cursor(None), selected_color=ACCENT,
                                selected_hover_color=ACCENT_H, unselected_color=CARD,
                                unselected_hover_color=BORDER, fg_color=CARD,
                                text_color=TEXT).pack(fill="x", pady=(2, 2))
-        ctk.CTkLabel(side, text="Brush: L-drag paint · R-drag erase\nPick: click speck / wing / body",
+        ctk.CTkLabel(side, text="Brush: L-drag paint · R-drag erase\n"
+                                "Pick: click speck / wing / body\n"
+                                "Remove dust: click a circle to delete it",
                      text_color=MUTED, justify="left", anchor="w").pack(fill="x")
         self.brush = self._slider(side, "Brush size (px)", 2, 150, 14, 148, "{:.0f}")
         self._btn(side, "Mask all dust", self.mask_dust)
@@ -109,14 +114,16 @@ class App(ctk.CTk):
         self._section(side, "VIEW")
         self.v_body, self.v_wings = ctk.BooleanVar(value=True), ctk.BooleanVar(value=True)
         self.v_dust, self.v_mask = ctk.BooleanVar(value=True), ctk.BooleanVar(value=True)
+        self.v_zone = ctk.BooleanVar(value=False)
         for text, var in (("Body", self.v_body), ("Wings", self.v_wings),
-                          ("Dust specks", self.v_dust), ("Mask", self.v_mask)):
+                          ("Dust specks", self.v_dust), ("Mask", self.v_mask),
+                          ("Keep-away zone", self.v_zone)):
             ctk.CTkSwitch(side, text=text, variable=var, command=self.request_render, text_color=TEXT,
                           progress_color=ACCENT, button_color=TEXT, fg_color=BORDER).pack(anchor="w", pady=2)
         self._btn(side, "Fit to window", self.fit_and_render)
 
         self._section(side, "EXPORT")
-        self._btn(side, "Save mask + masked copy", self.save, primary=True)
+        self._btn(side, "Output annotation", self.export, primary=True)
         self.stats = ctk.CTkLabel(side, text="", text_color=MUTED, justify="left", anchor="w")
         self.stats.pack(fill="x", pady=(10, 0))
         ctk.CTkLabel(side, text="Wheel: zoom · Shift/middle-drag: pan", text_color=MUTED,
@@ -226,17 +233,21 @@ class App(ctk.CTk):
         def work():
             full = core.imread(p)
             proc, scale = core.make_proxy(full)
-            saved = core.load_mask(core.work_dir_for(p), proc.shape[:2])
-            return full, proc, scale, saved
+            out = core.output_dir_for(p)
+            saved = core.load_mask(out, proc.shape[:2], core.clean_stem(p))
+            specks = core.load_dust(out, scale)
+            return full, proc, scale, saved, specks
 
         def done(res):
-            self.src, (self.full, self.proc, self.scale, saved) = p, res
+            self.src = p
+            self.full, self.proc, self.scale, saved, specks = res
             self.mask = saved if saved is not None else np.zeros(self.proc.shape[:2], np.uint8)
-            self.det, self.specks, self.undo_stack = None, [], []
-            self._set_specks([])
+            self.det, self.undo_stack = None, []
+            self._set_specks(specks)
             self.fit_and_render()
             h, w = self.full.shape[:2]
-            self.status(f"{p.name}  ·  {w}×{h}px" + ("  ·  restored saved mask" if saved is not None else ""))
+            note = "  ·  restored previous annotation" if (saved is not None or specks) else ""
+            self.status(f"{p.name}  ·  {w}×{h}px{note}")
             self._update_stats()
 
         self._run("Loading image…", work, done)
@@ -258,31 +269,49 @@ class App(ctk.CTk):
     def detect_dust(self) -> None:
         if not self._need_image():
             return
-        proc, s, md = self.proc, self.sens_dust.get(), int(self.max_speck.get())
-        body = self.det.body if (self.det and self.ignore_body.get()) else None
+        proc = self.proc
+        s, md, margin = self.sens_dust.get(), int(self.max_speck.get()), int(self.keep_away.get())
+        avoid, det0, sens_bw = self.avoid_fly.get(), self.det, self.sens_bw.get()
 
-        def done(specks):
+        def work():
+            det = det0
+            if avoid and det is None:       # need the dragonfly outline first
+                det = core.detect_body_and_wings(proc, sens_bw)
+            zone = core.exclusion_zone(det, margin, proc.shape[:2]) if avoid else None
+            return det, core.detect_dust(proc, zone, s, md)
+
+        def done(res):
+            det, specks = res
+            self.det = det
+            self._push_undo()
             self._set_specks(specks)
-            self.status(f"{len(specks)} dust speck(s) found. Use Pick to toggle one, or Mask all dust.")
+            warn = ""
+            if avoid and det is not None and not det.body.any() and not det.wing_contours:
+                warn = "  (dragonfly NOT found – nothing excluded, tune body/wing sensitivity)"
+            self.status(f"{len(specks)} dust speck(s) found outside the dragonfly.{warn} "
+                        "Use “Remove dust” to delete circles.")
             self._update_stats()
             self.request_render()
 
-        self._run("Hunting dust specks…", lambda: core.detect_dust(proc, body, s, md, body is not None), done)
+        self._run("Hunting dust specks…", work, done)
 
     def _set_specks(self, specks) -> None:
-        self.specks = specks
-        self.sp_x = np.array([s.cx for s in specks])
-        self.sp_y = np.array([s.cy for s in specks])
-        self.sp_r = np.array([s.r for s in specks])
+        self.specks = list(specks)
+        self.sp_x = np.array([s.cx for s in self.specks])
+        self.sp_y = np.array([s.cy for s in self.specks])
+        self.sp_r = np.array([s.r for s in self.specks])
 
     # ------------------------------------------------------------- masking
     def _push_undo(self) -> None:
-        self.undo_stack.append(self.mask.copy())
+        if self.mask is None:
+            return
+        self.undo_stack.append((self.mask.copy(), list(self.specks)))
         del self.undo_stack[:-15]
 
     def undo(self) -> None:
         if self.undo_stack and self.mask is not None:
-            self.mask = self.undo_stack.pop()
+            self.mask, specks = self.undo_stack.pop()
+            self._set_specks(specks)
             self._update_stats()
             self.request_render()
 
@@ -319,6 +348,25 @@ class App(ctk.CTk):
         self._push_undo()
         region = self.det.body > 0 if which == "body" else self.det.wings > 0
         self.mask[region] = 255
+        self._update_stats()
+        self.request_render()
+
+    def _remove_speck(self, e) -> None:
+        if not len(self.specks):
+            self.status("No dust circles to remove.")
+            return
+        x, y = self._to_img(e.x, e.y)
+        d = np.hypot(self.sp_x - x, self.sp_y - y) * self.zoom          # distance in screen px
+        i = int(d.argmin())
+        if d[i] > max(10.0, self.sp_r[i] * self.zoom + 8):
+            return
+        s = self.specks[i]
+        H, W = self.mask.shape
+        self._push_undo()
+        if self.mask[min(int(s.cy), H - 1), min(int(s.cx), W - 1)] > 0:
+            self._paint_speck(s, 0)                                       # it was never dust: unmask it too
+        self._set_specks(self.specks[:i] + self.specks[i + 1:])
+        self.status(f"Removed 1 dust circle · {len(self.specks)} left (Ctrl+Z to undo).")
         self._update_stats()
         self.request_render()
 
@@ -364,16 +412,17 @@ class App(ctk.CTk):
         cv2.circle(self.mask, b, r, value, -1)
 
     # -------------------------------------------------------------- saving
-    def save(self) -> None:
+    def export(self) -> None:
         if not self._need_image():
             return
-        src, full, mask, det, specks, scale = self.src, self.full, self.mask.copy(), self.det, self.specks, self.scale
+        src, full, mask, det, specks, scale = (self.src, self.full, self.mask.copy(), self.det,
+                                               list(self.specks), self.scale)
 
         def done(out):
-            self.status(f"Saved → {out}")
+            self.status(f"Annotation saved → {out}")
 
-        self._run("Writing full-resolution files…",
-                  lambda: core.save_outputs(src, full, mask, det, specks, scale), done)
+        self._run("Writing full-resolution annotation…",
+                  lambda: core.save_annotation(src, full, mask, det, specks, scale), done)
 
     def _update_stats(self) -> None:
         if self.mask is None:
@@ -435,6 +484,9 @@ class App(ctk.CTk):
         def tf(c: np.ndarray) -> np.ndarray:
             return ((c.reshape(-1, 2).astype(np.float32) - (ix0, iy0)) * z).astype(np.int32)
 
+        if self.v_zone.get() and self.det is not None:
+            zone = core.exclusion_zone(self.det, int(self.keep_away.get()), (H, W))
+            tint(zone, C_ZONE, 0.25)
         if self.det is not None:
             if self.v_wings.get():
                 tint(self.det.wings, C_WING, 0.30)
@@ -486,8 +538,12 @@ class App(ctk.CTk):
         if button == 2 or (e.state & 0x1):
             self._drag = "pan"
             return
-        if self.tool.get() == "Pick":
+        tool = self.tool.get()
+        if tool == "Pick":
             self._pick(e, None if button == 1 else False)
+            return
+        if tool == "Remove dust":
+            self._remove_speck(e)
             return
         self._push_undo()
         self._drag = "paint" if button == 1 else "erase"
