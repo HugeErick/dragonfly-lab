@@ -1,7 +1,7 @@
 [project]
 name = "dragonfly-lab"
-version = "0.1.0"
-description = "CPU-only dragonfly macro inspector: body/wing detection, dust speck detection and manual masking"
+version = "0.2.0"
+description = "CPU-only ground-truth annotation assistant for dragonfly macro photos: body/wing/dust detection, manual correction and benchmark package builder"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
@@ -13,6 +13,7 @@ dependencies = [
 
 [project.scripts]
 dragonfly-lab = "dragonfly_lab.app:main"
+dragonfly-lab-benchmark = "dragonfly_lab.benchmark:main"
 
 [build-system]
 requires = ["hatchling"]
