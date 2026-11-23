@@ -15,35 +15,29 @@ from PIL import Image, ImageTk
 
 from . import benchmark, core
 
-# ---- palette (dark) -------------------------------------------------------
+# palette
 BG, PANEL, CARD, BORDER = "#0b0d12", "#12151c", "#181c25", "#262b38"
 TEXT, MUTED = "#d7dbe6", "#7d8499"
-ACCENT, ACCENT_H = "#6d5efc", "#8478ff"
+ACCENT, ACCENT_H = "#38bdf8", "#7dd3fc"
 DANGER, DANGER_H = "#3a1f27", "#55283a"
 
 # overlay colours (BGR for OpenCV). Region colours come from their class.
-C_DUST, C_DUST_DONE = (36, 191, 251), (128, 222, 74)
+C_DUST, C_DUST_DONE = (255, 170, 60), (60, 235, 255)
 C_MASK = (94, 63, 244)
 C_ZONE = (120, 120, 120)
-# dust-assist suggestions are drawn as SQUARES: candidate / needs review / also found by our own detector
-C_SUG, C_SUG_REVIEW, C_SUG_MATCH = (255, 170, 60), (200, 110, 255), (60, 235, 255)
+C_SUG, C_SUG_REVIEW, C_SUG_MATCH = (80, 220, 120), (60, 160, 255), (255, 120, 220)
 
 NODE_HIT, EDGE_HIT = 10, 8          # click tolerance in screen px
 
-TOOLS = [("Brush", "Brush"), ("Pick", "Pick"), ("Nodes", "Nodes"), ("Draw", "Draw"),
-         ("Dust", "Dust −"), ("AddDust", "Dust ＋"), ("TagDust", "Tag dust"), ("Assist", "Assist")]
+TOOLS = [("Brush", "Brush"), ("Pick", "Pick"), ("Nodes", "Nodes"), ("Draw", "Draw")]
 TOOL_HELP = {
     "Brush": "L-drag paint mask · R-drag erase",
     "Pick": "Click a region / speck to toggle its mask (R-click = unmask)",
     "Dust": "Click a dust circle to delete it (false positive)",
-    "AddDust": "Click a speck the detector missed to add it · it sits on whatever class is under it",
-    "TagDust": "Click a dust circle to attach it to the ACTIVE class · R-click = back to automatic",
     "Nodes": "Click a region to select it · drag a node to reshape · click an edge to add a node · "
              "R-click a node to delete it · drag inside the selected region to move it · Del removes it",
     "Draw": "Click to place points · click the first point, double-click or Enter to close · "
             "R-click undoes a point · Esc cancels",
-    "Assist": "Squares = helper suggestions (blue: candidate · pink: needs review · yellow: your detector "
-              "found it too) · click = accept as dust · R-click = reject",
 }
 
 
@@ -89,13 +83,6 @@ class App(ctk.CTk):
         self._dust_rev = 0                          # bumps whenever the dust list changes
         self._zone_cls_cache: tuple | None = None   # (key, class id per speck)
 
-        # optional dust-assist layer: suggestions only, never ground truth until a person accepts them
-        self.suggestions: list[core.Suggestion] = []
-        self.sg_x = self.sg_y = self.sg_r = np.zeros(0)
-        self.sg_pending = np.zeros(0, bool)
-        self.sg_match = np.zeros(0, int)            # index of the speck that already covers it (-1 = none)
-        self._recurrent: tuple | None = None        # (proxy shape, (N, 2) sensor-dust positions, proxy px)
-
         # segmentation state: user-defined classes + editable polygons
         self.classes: list[core.ClassDef] = core.default_classes()
         self.regions: list[core.Region] = []
@@ -122,12 +109,24 @@ class App(ctk.CTk):
         self.q: queue.Queue = queue.Queue()
         self.busy = False
 
+        # dust detector (no UI for these, fixed defaults)
+        self.as_sens = ctk.DoubleVar(value=5)       # assist sensitivity (unused: Dust sensitivity slider is used)
+        self.as_paper = ctk.BooleanVar(value=True)
+        self.as_rec = ctk.BooleanVar(value=False)   # recurrent-dust session: no UI to load one any more
+        self.as_full = ctk.BooleanVar(value=True)   # run on full-res image
+        self.as_save = ctk.BooleanVar(value=False)  # no suggestions file on export
+        self._recurrent = None
+        self.suggestions: list = []
+        self.sg_x = self.sg_y = self.sg_r = np.zeros(0)
+        self.sg_pending = np.zeros(0, bool)
+        self.sg_match = np.zeros(0, int)
+
         self._build()
         self.bind_all("<Control-z>", self._undo_key)
         self.bind_all("<Command-z>", self._undo_key)
         self.after(60, self._poll)
 
-    # ------------------------------------------------------------------ UI
+    # UI
     def _build(self) -> None:
         self.grid_columnconfigure(1, weight=1)
         self.grid_rowconfigure(0, weight=1)
@@ -136,9 +135,9 @@ class App(ctk.CTk):
                                       scrollbar_button_color=BORDER, scrollbar_button_hover_color=MUTED)
         side.grid(row=0, column=0, sticky="nsw")
 
-        ctk.CTkLabel(side, text="🪰  Dragonfly Lab", font=ctk.CTkFont(size=20, weight="bold"),
+        ctk.CTkLabel(side, text="Dragonfly Lab", font=ctk.CTkFont(size=20, weight="bold"),
                      text_color=TEXT, anchor="w").pack(fill="x", pady=(8, 2))
-        ctk.CTkLabel(side, text="Ground-truth annotation assistant", text_color=MUTED,
+        ctk.CTkLabel(side, text="Annotation assistant", text_color=MUTED,
                      anchor="w").pack(fill="x", pady=(0, 10))
 
         self._btn(side, "Open image…", self.open_image, primary=True)
@@ -155,10 +154,9 @@ class App(ctk.CTk):
                       command=self.request_render, text_color=TEXT, progress_color=ACCENT,
                       button_color=TEXT, fg_color=BORDER).pack(anchor="w", pady=(4, 2))
         self.keep_away = self._slider(side, "Keep-away margin (px)", 0, 150, 40, 150, "{:.0f}")
-        self._btn(side, "Detect dust specks", self.detect_dust)
-        self._build_assist(side)
+        self._btn(side, "Detect dust specks", self.assist_detect)
 
-        # ---- classes
+        # classes
         self._section(side, "CLASSES")
         self.cls_frame = ctk.CTkFrame(side, fg_color=CARD, corner_radius=6)
         self.cls_frame.pack(fill="x")
@@ -167,15 +165,15 @@ class App(ctk.CTk):
         self._btn(row, "＋ New", self.new_class, side="left")
         self._btn(row, "Rename", self.rename_class, side="left")
         self._btn(row, "Delete", self.delete_class, side="left", danger=True)
-        ctk.CTkLabel(side, text="swatch: colour · name: make active (new regions use it)\n"
+        ctk.CTkLabel(side, text="switch: colour · name: make active (new regions use it)\n"
                                 "show: visible · guard: dust detection keeps away",
                      text_color=MUTED, justify="left", anchor="w", wraplength=260).pack(fill="x", pady=(4, 0))
 
-        # ---- tools
+        # tools
         self._section(side, "TOOL")
         self.tool = ctk.StringVar(value="Brush")
         self._tool_btns: dict[str, ctk.CTkButton] = {}
-        for chunk in (TOOLS[:4], TOOLS[4:]):
+        for chunk in (TOOLS[:2], TOOLS[2:]):
             row = ctk.CTkFrame(side, fg_color="transparent")
             row.pack(fill="x", pady=1)
             for key, label in chunk:
@@ -190,6 +188,7 @@ class App(ctk.CTk):
         self.tool_help.pack(fill="x")
         self.brush = self._slider(side, "Brush size (px)", 2, 150, 14, 148, "{:.0f}")
         self.add_takes_active = ctk.BooleanVar(value=False)
+        # TODO: so new dust must have its own class
         ctk.CTkSwitch(side, text="New dust takes the active class", variable=self.add_takes_active,
                       text_color=TEXT, progress_color=ACCENT, button_color=TEXT,
                       fg_color=BORDER).pack(anchor="w", pady=(4, 2))
@@ -203,7 +202,7 @@ class App(ctk.CTk):
         self._btn(row, "→ Active class", self.assign_selected, side="left")
         self._btn(row, "Delete region", self.delete_selected, side="left", danger=True)
 
-        # ---- mask
+        # mask
         self._section(side, "MASK")
         self._btn(side, "Mask all dust", self.mask_dust)
         self._btn(side, "Mask active class", self.mask_active_class)
@@ -213,7 +212,7 @@ class App(ctk.CTk):
         self._btn(row, "Undo", self.undo, side="left")
         self._btn(row, "Clear mask", self.clear_mask, side="left", danger=True)
 
-        # ---- view
+        # view
         self._section(side, "VIEW")
         self.v_dust, self.v_mask = ctk.BooleanVar(value=True), ctk.BooleanVar(value=True)
         self.v_zone, self.v_sug = ctk.BooleanVar(value=False), ctk.BooleanVar(value=True)
@@ -225,7 +224,7 @@ class App(ctk.CTk):
                           progress_color=ACCENT, button_color=TEXT, fg_color=BORDER).pack(anchor="w", pady=2)
         self._btn(side, "Fit to window", self.fit_and_render)
 
-        # ---- export
+        # export
         self._section(side, "EXPORT")
         self._btn(side, "Output annotation", self.export, primary=True)
         self._btn(side, "Build benchmark package", self.build_package)
@@ -274,41 +273,6 @@ class App(ctk.CTk):
 
         self._rebuild_classes()
 
-    def _build_assist(self, side) -> None:
-        """Optional second opinion from dust_assist.py (detection only, never ground truth)."""
-        self.as_save = ctk.BooleanVar(value=False)
-        self._section(side, "ASSIST · 2nd opinion (optional)")
-        if not core.ASSIST_AVAILABLE:
-            why = f" ({core.ASSIST_ERROR})" if core.ASSIST_ERROR else ""
-            ctk.CTkLabel(side, text=f"dust_assist.py is not available{why} – helper disabled.",
-                         text_color=MUTED, justify="left", anchor="w", wraplength=260).pack(fill="x")
-            return
-        ctk.CTkLabel(side, text="Proposals from a second detector. They are NOT ground truth: review each "
-                                "one with the Assist tool (click = accept, R-click = reject).",
-                     text_color=MUTED, justify="left", anchor="w", wraplength=260).pack(fill="x")
-        self.as_sens = self._slider(side, "Assist sensitivity", 1, 10, 5, 9, "{:.0f}")
-        self.as_paper = ctk.BooleanVar(value=True)
-        self.as_rec = ctk.BooleanVar(value=True)
-        self.as_full = ctk.BooleanVar(value=False)
-        for text, var in (("Also propose dust on paper / label", self.as_paper),
-                          ("Use recurrent-dust session (if loaded)", self.as_rec),
-                          ("Full resolution (slow, lots of RAM)", self.as_full),
-                          ("Save suggestions file on export (not GT)", self.as_save)):
-            ctk.CTkSwitch(side, text=text, variable=var, text_color=TEXT, progress_color=ACCENT,
-                          button_color=TEXT, fg_color=BORDER).pack(anchor="w", pady=2)
-        self._btn(side, "Suggest dust (helper)", self.assist_detect)
-        row = ctk.CTkFrame(side, fg_color="transparent")
-        row.pack(fill="x", pady=(4, 0))
-        self._btn(row, "Accept candidates", self.assist_accept_candidates, side="left")
-        self._btn(row, "Clear", self.assist_clear, side="left", danger=True)
-        row = ctk.CTkFrame(side, fg_color="transparent")
-        row.pack(fill="x", pady=(2, 0))
-        self._btn(row, "Propose paper/info", self.assist_paper_region, side="left")
-        self._btn(row, "Session…", self.assist_load_session, side="left")
-        ctk.CTkLabel(side, text="Accept candidates skips the ones marked “review”. Session… = pick ≥ 3 photos "
-                                "of the same shoot (same size) to flag sensor dust that repeats.",
-                     text_color=MUTED, justify="left", anchor="w", wraplength=260).pack(fill="x", pady=(2, 0))
-
     def _section(self, parent, text: str) -> None:
         ctk.CTkLabel(parent, text=text, text_color=MUTED, anchor="w",
                      font=ctk.CTkFont(size=11, weight="bold")).pack(fill="x", pady=(18, 4))
@@ -332,10 +296,10 @@ class App(ctk.CTk):
         val = ctk.CTkLabel(row, text=fmt.format(init), text_color=MUTED)
         val.pack(side="right")
         _Slider(parent, from_=lo, to=hi, number_of_steps=steps, variable=var, fg_color=BORDER,
-                      progress_color=ACCENT, button_color=ACCENT, button_hover_color=ACCENT_H,
-                      command=lambda v: (val.configure(text=fmt.format(v)), self._cursor(None),
-                                         self.request_render())
-                      ).pack(fill="x", pady=(2, 4))
+                progress_color=ACCENT, button_color=ACCENT, button_hover_color=ACCENT_H,
+                command=lambda v: (val.configure(text=fmt.format(v)), self._cursor(None),
+                                   self.request_render())
+                ).pack(fill="x", pady=(2, 4))
         return var
 
     def status(self, text: str) -> None:
@@ -357,7 +321,7 @@ class App(ctk.CTk):
         self._cursor(None)
         self.request_render()
 
-    # ------------------------------------------------------- class manager
+    # class manager
     def _rebuild_classes(self) -> None:
         f = self.cls_frame
         for w in f.winfo_children():
@@ -567,6 +531,7 @@ class App(ctk.CTk):
         return {c.id for c in self.classes if c.guard}
 
     def detect_dust(self) -> None:
+        """Old detector, no longer wired to a button (kept for now)."""
         if not self._need_image():
             return
         proc = self.proc
@@ -610,7 +575,7 @@ class App(ctk.CTk):
         self.sp_r = np.array([s.r for s in self.specks])
         self._refresh_matches()
 
-    # ------------------------------------------------ assist (optional suggestion layer)
+    # ------------------------------------------------ assist (dust helper)
     def _assist_ok(self) -> bool:
         if not core.ASSIST_AVAILABLE:
             self.status("The dust-assist helper (dust_assist.py) is not available.")
@@ -655,7 +620,7 @@ class App(ctk.CTk):
         spec = core.rasterize(self.regions, shape, guarded)
         doc = core.rasterize(self.regions, shape, {core.INFO_ID})
         use_spec, use_doc = bool(spec.any()), bool(doc.any())
-        sens, paper = float(self.as_sens.get()), bool(self.as_paper.get())
+        sens, paper = float(self.sens_dust.get()), bool(self.as_paper.get())
         hi = bool(self.as_full.get()) and scale < 1.0
         rec = self._recurrent_for(shape, scale, hi)
         old_rejected = [s for s in self.suggestions if s.decision == "rejected"]
@@ -684,18 +649,18 @@ class App(ctk.CTk):
                         sugs[n] = replace(s, decision="rejected")
             self._push_undo()
             self._set_suggestions(sugs)
-            pend = [s for s in sugs if s.decision == "pending"]
-            n_rev = sum(s.status == "review" for s in pend)
-            n_match = int((self.sg_match >= 0).sum())
+            pend = [i for i, s in enumerate(sugs) if s.decision == "pending"]
+            n_rev = sum(sugs[i].status == "review" for i in pend)
+            before = len(self.specks)
+            self._accept_suggestions(pend, push=False)      # straight into the dust list
+            added = len(self.specks) - before
             base = "your body / wing regions" if use_spec else "its own automatic protection (no body / wing regions yet)"
-            extra = f" · {len(rec)} recurrent position(s) used" if rec is not None else ""
-            self.status(f"{len(pend)} suggestion(s): {len(pend) - n_rev} candidate, {n_rev} to review, "
-                        f"{n_match} also found by your detector · protected via {base}{extra}. "
-                        "Assist tool: click accepts, R-click rejects.")
+            self.status(f"{added} new dust speck(s) from the helper ({n_rev} were flagged “review”) · "
+                        f"{len(self.specks)} total · protected via {base}. Ctrl+Z undoes the whole detection.")
             self._update_stats()
             self.request_render()
 
-        self._run("Asking the dust-assist helper…", work, done)
+        self._run("Detecting dust…", work, done)
 
     def _nearest_suggestion(self, e) -> int | None:
         if not self.sg_pending.any():
@@ -717,7 +682,7 @@ class App(ctk.CTk):
         else:
             self._reject_suggestion(i)
 
-    def _accept_suggestions(self, idx: list[int]) -> None:
+    def _accept_suggestions(self, idx: list[int], push: bool = True) -> None:
         """A person confirms the suggestion as dust: it becomes an ordinary hand-curated speck
         (origin "manual", suggested_by "dust_assist"). If our own detector already has that speck, no
         duplicate is added."""
@@ -732,7 +697,8 @@ class App(ctk.CTk):
                     sp = replace(sp, cls=self.active_cls)
                 new.append(sp)
             sugs[i] = replace(s, decision="accepted")
-        self._push_undo()
+        if push:
+            self._push_undo()
         self._set_suggestions(sugs)
         if new:
             self._set_specks(self.specks + new)

@@ -5,3 +5,7 @@ __pycache__/
 
 # masks + image copies produced by the tool
 work/
+
+benchmark/*
+
+
