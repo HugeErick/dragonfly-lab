@@ -26,7 +26,7 @@ C_DUST, C_DUST_DONE = (255, 170, 60), (60, 235, 255)
 C_MASK = (94, 63, 244)
 C_ZONE = (120, 120, 120)
 NODE_HIT, EDGE_HIT = 10, 8          # click tolerance in screen px
-NODE_EPS = 2.0
+NODE_EPS = 14.0
 KEEP_AWAY = 20
 
 TOOLS = [("Brush", "Brush"), ("Pick", "Pick"), ("Nodes", "Nodes"), ("Draw", "Draw")]
